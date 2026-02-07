@@ -19,6 +19,12 @@ SPONSOR_CHANNEL_ID = os.environ.get("SPONSOR_CHANNEL_ID", "")
 TARGET_CHANNEL_ID = os.environ.get("TARGET_CHANNEL_ID", "")
 SPONSOR_CHANNEL_USERNAME = os.environ.get("SPONSOR_CHANNEL_USERNAME", "")
 
+# ادمین‌ها: لیست آیدی عددی‌ها با کاما (مثال: "123,456")
+ADMIN_IDS = os.environ.get("ADMIN_IDS", "")
+
+# تگ انتهای پیام‌های کانال
+FOOTER_TAG = os.environ.get("FOOTER_TAG", "@config2v")
+
 # اختیاری: اگر تلگرام فیلتر است، آدرس پروکسی (مثلاً socks5://127.0.0.1:1080)
 PROXY_URL = os.environ.get("PROXY_URL", "").strip() or None
 
