@@ -14,7 +14,14 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-from config import BOT_TOKEN, TARGET_CHANNEL_ID, ADMIN_IDS, FOOTER_TAG
+from config import (
+    BOT_TOKEN,
+    TARGET_CHANNEL_ID,
+    ADMIN_IDS,
+    FOOTER_TAG,
+    SPONSOR_CHANNEL_ID,
+    SPONSOR_CHANNEL_USERNAME,
+)
 
 # -------------------- Conversation States --------------------
 CHOOSE_TYPE, ASK_NAME, ASK_OPERATOR, ASK_PAYLOAD = range(4)
@@ -96,7 +103,6 @@ def is_proxy(text: str) -> bool:
 
 def is_config(text: str) -> bool:
     t = (text or "").strip()
-    # v2ray + subscription links
     return bool(
         re.match(r"^(vmess|vless|trojan|ss|ssr)://", t, re.IGNORECASE)
         or re.match(r"^https?://", t, re.IGNORECASE)
@@ -121,12 +127,71 @@ async def show_main_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text:
 
 
 def channel_footer(operator_label: str, sender_name: str) -> str:
-    # انتهای پیام کانال
     return (
         f"📶 <b>اپراتور:</b> {escape_html(operator_label)}\n"
         f"👤 <b>ارسال‌کننده:</b> {escape_html(sender_name)}\n"
         f"{escape_html(FOOTER_TAG)}"
     )
+
+
+def sponsor_join_keyboard():
+    sponsor_url = f"https://t.me/{SPONSOR_CHANNEL_USERNAME.lstrip('@')}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 رفتن به کانال اسپانسر", url=sponsor_url)],
+        [InlineKeyboardButton("✅ عضو شدم (بررسی)", callback_data="sponsor:check")],
+    ])
+
+
+async def is_member_of_sponsor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check membership of sponsor channel. Admins bypass."""
+    user = update.effective_user
+    if not user:
+        return False
+    if is_admin(user.id):
+        return True
+
+    try:
+        member = await context.bot.get_chat_member(SPONSOR_CHANNEL_ID, user.id)
+        # statuses: creator, administrator, member, restricted, left, kicked
+        return member.status in ("creator", "administrator", "member")
+    except Exception:
+        # اگر ربات دسترسی نداشته باشه یا کانال خصوصی باشه و ادمین نباشه
+        return False
+
+
+async def ensure_sponsor_member_or_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Returns True if member, else sends prompt and returns False."""
+    ok = await is_member_of_sponsor(update, context)
+    if ok:
+        return True
+
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "❗️برای استفاده از ربات، اول باید عضو کانال اسپانسر بشی.\n\n"
+                f"کانال اسپانسر: {SPONSOR_CHANNEL_USERNAME}"
+            ),
+            reply_markup=sponsor_join_keyboard(),
+        )
+    return False
+
+
+# -------------------- Sponsor check button --------------------
+async def sponsor_check_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    # یک Update بسازیم برای check (همین update کافیه)
+    ok = await is_member_of_sponsor(update, context)
+    if ok:
+        context.user_data.clear()
+        await q.message.reply_text("✅ عضویت تایید شد.")
+        await show_main_menu(q.message.chat_id, context, "چی می‌خوای ارسال کنی؟")
+        return CHOOSE_TYPE
+    else:
+        await q.message.reply_text("❌ هنوز عضو نیستی یا ربات دسترسی بررسی نداره. دوباره تلاش کن.")
+        return ConversationHandler.END
 
 
 # -------------------- Conversation Flow --------------------
@@ -140,6 +205,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ربات فعلاً خاموشه ❌")
         return ConversationHandler.END
 
+    # چک عضویت اسپانسر
+    if not await ensure_sponsor_member_or_prompt(update, context):
+        return ConversationHandler.END
+
     context.user_data.clear()
     await show_main_menu(update.effective_chat.id, context, "سلام 👋\nچی می‌خوای ارسال کنی؟")
     return CHOOSE_TYPE
@@ -148,6 +217,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
+    # چک عضویت اسپانسر
+    if not await ensure_sponsor_member_or_prompt(update, context):
+        return ConversationHandler.END
 
     data = q.data or ""
     if not data.startswith("type:"):
@@ -174,6 +247,10 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # چک عضویت اسپانسر
+    if not await ensure_sponsor_member_or_prompt(update, context):
+        return ConversationHandler.END
+
     name = clean_sender_name(update.message.text)
     if not name:
         await update.message.reply_text("❌ یک اسم معتبر بفرست (حداقل ۱ حرف).")
@@ -193,6 +270,10 @@ async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
+    # چک عضویت اسپانسر
+    if not await ensure_sponsor_member_or_prompt(update, context):
+        return ConversationHandler.END
 
     data = q.data or ""
     if not data.startswith("op:"):
@@ -231,6 +312,10 @@ async def receive_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if not bot_state["enabled"] and not is_admin(user_id):
+        return ConversationHandler.END
+
+    # چک عضویت اسپانسر
+    if not await ensure_sponsor_member_or_prompt(update, context):
         return ConversationHandler.END
 
     payload = (update.message.text or "").strip()
@@ -272,7 +357,6 @@ async def receive_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("✅ پروکسی با موفقیت منتشر شد.")
 
-        # برگشت به منوی اصلی
         context.user_data.clear()
         await show_main_menu(update.effective_chat.id, context)
         return CHOOSE_TYPE
@@ -303,7 +387,6 @@ async def receive_payload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ کانفیگ با موفقیت منتشر شد.")
 
-    # برگشت به منوی اصلی
     context.user_data.clear()
     await show_main_menu(update.effective_chat.id, context)
     return CHOOSE_TYPE
@@ -369,6 +452,9 @@ async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- Main --------------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # sponsor button check (works outside conversation too)
+    app.add_handler(CallbackQueryHandler(sponsor_check_button, pattern=r"^sponsor:check$"))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
