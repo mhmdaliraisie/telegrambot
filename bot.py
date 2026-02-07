@@ -1,491 +1,175 @@
-# -*- coding: utf-8 -*-
-"""
-ربات تلگرام: دریافت کانفیگ V2Ray و پروکسی و ارسال به کانال
-"""
-import logging
-import html
-import re
 import json
-from pathlib import Path
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import os
+import re
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
-from telegram.constants import ChatMemberStatus
-from telegram.request import HTTPXRequest
-import config
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+from config import (
+    BOT_TOKEN,
+    TARGET_CHANNEL_ID,
+    SPONSOR_CHANNEL_ID,
+    SPONSOR_CHANNEL_USERNAME,
+    ADMIN_IDS,
+    FOOTER_TAG,
 )
-logger = logging.getLogger(__name__)
 
-# کلیدهای حالت کاربر
-STATE_CONFIG_LINK = "config_link"
-STATE_CONFIG_NAME = "config_name"
-STATE_CONFIG_OPERATOR = "config_operator"
-STATE_PROXY_LINK = "proxy_link"
-STATE_PROXY_NAME = "proxy_name"
-STATE_PROXY_OPERATOR = "proxy_operator"
-
-OPERATORS = [
-    ("ایرانسل", "ایرانسل"),
-    ("همراه اول", "همراه اول"),
-    ("رایتل", "رایتل"),
-    ("سامان تل", "سامان تل"),
-    ("نت خانگی", "نت خانگی"),
-]
+BANNED_FILE = "banned.json"
+BOT_STATE_FILE = "bot_state.json"
 
 
+# ---------- utils ----------
+def load_json(path, default):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return default
 
-# وضعیت کلی ربات (روشن/خاموش) و لیست بن
-BOT_ENABLED: bool = True
-BANNED_PATH = Path(__file__).parent / "banned.json"
 
-def _load_banned() -> set[int]:
-    try:
-        if BANNED_PATH.exists():
-            data = json.loads(BANNED_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                return {int(x) for x in data}
-    except Exception as e:
-        logger.warning("failed to load banned list: %s", e)
-    return set()
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def _save_banned(banned: set[int]) -> None:
-    try:
-        BANNED_PATH.write_text(json.dumps(sorted(banned)), encoding="utf-8")
-    except Exception as e:
-        logger.warning("failed to save banned list: %s", e)
 
-BANNED_USERS: set[int] = _load_banned()
+banned_users = set(load_json(BANNED_FILE, []))
+bot_state = load_json(BOT_STATE_FILE, {"enabled": True})
 
-def _parse_admin_ids(raw: str) -> set[int]:
-    ids = set()
-    for part in (raw or "").split(","):
-        part = part.strip()
-        if part and part.lstrip("-").isdigit():
-            ids.add(int(part))
-    return ids
-
-ADMIN_IDS: set[int] = _parse_admin_ids(getattr(config, "ADMIN_IDS", ""))
-
-FOOTER_TAG = getattr(config, "FOOTER_TAG", "@config2v").strip() or "@config2v"
-if not FOOTER_TAG.startswith("@"):
-    FOOTER_TAG = "@" + FOOTER_TAG
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-def is_bot_enabled() -> bool:
-    return BOT_ENABLED
 
-def reject_if_disabled(update: Update) -> bool:
-    """اگر ربات خاموش است و کاربر ادمین نیست، پیام مناسب بده و True برگردون."""
-    global BOT_ENABLED
-    user = update.effective_user
-    if not user:
-        return True
-    if not BOT_ENABLED and not is_admin(user.id):
-        # برای جلوگیری از اسپم، یک پیام کوتاه
-        if update.message:
-            update.message.reply_text("⛔️ ربات موقتاً خاموش است. لطفاً بعداً تلاش کنید.")
-        return True
-    return False
-
-def is_banned(user_id: int) -> bool:
-    return user_id in BANNED_USERS
-
-def is_valid_v2ray_config(text: str) -> bool:
-    t = (text or "").strip()
-    if len(t) < 10:
-        return False
-    schemes = (
-        "vmess://", "vless://", "trojan://", "ss://", "ssr://",
-        "hysteria://", "hysteria2://", "tuic://", "hy2://",
-        "naive+https://", "wireguard://",
+def is_config(text: str) -> bool:
+    return bool(
+        re.match(
+            r"^(vmess|vless|trojan|ss|ssr)://", text.strip(), re.IGNORECASE
+        )
+        or re.match(r"^https?://", text.strip())
     )
-    if t.lower().startswith(schemes):
-        return True
-    # لینک اشتراک (subscription)
-    if re.match(r"^https?://\S+$", t, flags=re.IGNORECASE):
-        return True
-    return False
-
-def is_valid_proxy_link(text: str) -> bool:
-    t = (text or "").strip()
-    if len(t) < 10:
-        return False
-    # MTProto / SOCKS لینک‌های تلگرام
-    if t.lower().startswith(("tg://proxy?", "tg://socks?")):
-        return True
-    if re.match(r"^https?://t\.me/(proxy|socks)\?\S+$", t, flags=re.IGNORECASE):
-        return True
-    if re.match(r"^t\.me/(proxy|socks)\?\S+$", t, flags=re.IGNORECASE):
-        return True
-    return False
-
-def get_sponsor_channel_id():
-    cid = config.SPONSOR_CHANNEL_ID.strip()
-    if cid.lstrip("-").isdigit():
-        return int(cid)
-    return cid
 
 
-def get_target_channel_id():
-    cid = config.TARGET_CHANNEL_ID.strip()
-    if cid.lstrip("-").isdigit():
-        return int(cid)
-    return cid
+def is_proxy(text: str) -> bool:
+    return bool(
+        re.match(r"^tg://(proxy|socks)\?", text.strip())
+        or re.match(r"^https://t\.me/(proxy|socks)\?", text.strip())
+        or re.match(r"^t\.me/(proxy|socks)\?", text.strip())
+    )
 
 
-async def is_member_of_sponsor(application: Application, user_id: int) -> bool:
-    """بررسی عضویت کاربر در کانال اسپانسر"""
-    try:
-        member = await application.bot.get_chat_member(
-            get_sponsor_channel_id(), user_id
-        )
-        return member.status in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        )
-    except Exception as e:
-        logger.warning("check sponsor membership: %s", e)
-        return False
-
-
-def main_menu_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📤 ارسال کانفیگ", callback_data="send_config"),
-            InlineKeyboardButton("📤 ارسال پروکسی", callback_data="send_proxy"),
-        ],
-    ])
-
-
-def operator_keyboard(prefix: str):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(op[0], callback_data=f"{prefix}_{op[1]}")]
-        for op in OPERATORS
-    ])
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user:
-        return
-    context.user_data.clear()
-
-    # بن/خاموشی ربات
-    if is_banned(user.id):
-        await update.message.reply_text("⛔️ شما از استفاده از ربات محروم شده‌اید.")
-        return
-    if not is_bot_enabled() and not is_admin(user.id):
-        await update.message.reply_text("⛔️ ربات موقتاً خاموش است. لطفاً بعداً تلاش کنید.")
-        return
-
-    is_member = await is_member_of_sponsor(context.application, user.id)
-    sponsor_username = config.SPONSOR_CHANNEL_USERNAME.strip()
-    if not sponsor_username.startswith("@"):
-        sponsor_username = "@" + sponsor_username
-
-    if not is_member:
-        await update.message.reply_text(
-            "👋 برای استفاده از ربات، ابتدا در کانال اسپانسر ما عضو شوید:\n\n"
-            f"➡️ {sponsor_username}\n\n"
-            "بعد از عضویت روی /start بزنید.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("عضویت در کانال", url=f"https://t.me/{sponsor_username.lstrip('@')}")],
-                [InlineKeyboardButton("✅ عضو شدم", callback_data="check_join")],
-            ]),
-        )
-        return
-
+# ---------- handlers ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ به ربات خوش آمدید.\n\nیکی از گزینه‌ها را انتخاب کنید:",
-        reply_markup=main_menu_keyboard(),
+        "سلام 👋\nکانفیگ یا لینک پروکسی معتبر بفرست."
     )
 
 
-async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    if not user:
+async def admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
-    if is_banned(user.id):
-        await query.edit_message_text("⛔️ شما از استفاده از ربات محروم شده‌اید.")
-        return
-    if not is_bot_enabled() and not is_admin(user.id):
-        await query.edit_message_text("⛔️ ربات موقتاً خاموش است. لطفاً بعداً تلاش کنید.")
-        return
-    if query.data != "check_join":
-        return
-    user = update.effective_user
-    if not user:
-        return
-
-    is_member = await is_member_of_sponsor(context.application, user.id)
-    if not is_member:
-        await query.edit_message_text(
-            "❌ هنوز در کانال عضو نشدید. پس از عضویت روی دکمه زیر بزنید.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("عضویت در کانال", url=f"https://t.me/{config.SPONSOR_CHANNEL_USERNAME.strip().lstrip('@')}")],
-                [InlineKeyboardButton("✅ عضو شدم", callback_data="check_join")],
-            ]),
-        )
-        return
-
-    await query.edit_message_text(
-        "✅ به ربات خوش آمدید.\n\nیکی از گزینه‌ها را انتخاب کنید:",
-        reply_markup=main_menu_keyboard(),
+    await update.message.reply_text(
+        f"وضعیت ربات: {'روشن ✅' if bot_state['enabled'] else 'خاموش ❌'}\n"
+        f"تعداد بن‌شده‌ها: {len(banned_users)}"
     )
 
 
-async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    if not user:
+async def admin_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
-    if is_banned(user.id):
-        await query.edit_message_text("⛔️ شما از استفاده از ربات محروم شده‌اید.")
+    bot_state["enabled"] = False
+    save_json(BOT_STATE_FILE, bot_state)
+    await update.message.reply_text("ربات خاموش شد ❌")
+
+
+async def admin_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
-    if not is_bot_enabled() and not is_admin(user.id):
-        await query.edit_message_text("⛔️ ربات موقتاً خاموش است. لطفاً بعداً تلاش کنید.")
+    bot_state["enabled"] = True
+    save_json(BOT_STATE_FILE, bot_state)
+    await update.message.reply_text("ربات روشن شد ✅")
+
+
+async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
-    user = update.effective_user
-    if not user:
+    if not context.args:
+        await update.message.reply_text("آیدی عددی کاربر رو بده.")
+        return
+    uid = int(context.args[0])
+    banned_users.add(uid)
+    save_json(BANNED_FILE, list(banned_users))
+    await update.message.reply_text(f"کاربر {uid} بن شد ⛔")
+
+
+async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("آیدی عددی کاربر رو بده.")
+        return
+    uid = int(context.args[0])
+    banned_users.discard(uid)
+    save_json(BANNED_FILE, list(banned_users))
+    await update.message.reply_text(f"کاربر {uid} آنبن شد ✅")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if user_id in banned_users:
         return
 
-    is_member = await is_member_of_sponsor(context.application, user.id)
-    if not is_member:
-        await query.edit_message_text(
-            "❌ برای ادامه باید در کانال اسپانسر عضو باشید. /start"
+    if not bot_state["enabled"] and not is_admin(user_id):
+        return
+
+    if is_proxy(text):
+        button = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔗 اتصال به پروکسی", url=text)]]
         )
-        return
-
-    if query.data == "send_config":
-        context.user_data["state"] = STATE_CONFIG_LINK
-        await query.edit_message_text(
-            "📤 یک لینک یا متن کانفیگ V2Ray خود را ارسال کنید (یک پیام)."
-        )
-    elif query.data == "send_proxy":
-        context.user_data["state"] = STATE_PROXY_LINK
-        await query.edit_message_text(
-            "📤 پروکسی تلگرام خود را ارسال کنید (یک پیام)."
-        )
-
-
-async def handle_config_operator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    if not user:
-        return
-    if is_banned(user.id):
-        await query.edit_message_text("⛔️ شما از استفاده از ربات محروم شده‌اید.")
-        return
-    if not is_bot_enabled() and not is_admin(user.id):
-        await query.edit_message_text("⛔️ ربات موقتاً خاموش است. لطفاً بعداً تلاش کنید.")
-        return
-    data = query.data or ""
-    if not data.startswith("config_"):
-        return
-    operator = data.replace("config_", "", 1)
-    context.user_data["config_operator"] = operator
-    context.user_data.pop("state", None)
-
-    link = context.user_data.get("config_link", "")
-    name = context.user_data.get("config_name", "")
-    channel_id = get_target_channel_id()
-    sender_username = update.effective_user.username if update.effective_user else ""
-    sender_id = update.effective_user.id if update.effective_user else 0
-
-    header = f'کانفیگ #v2ray ارسالی از "{html.escape(name)}"'
-    body = html.escape(link)
-    footer = f"اپراتور: {operator}\n\n{FOOTER_TAG}"
-    full_text = f"{header}\n\n<code>{body}</code>\n\n{footer}"
-
-    try:
         await context.bot.send_message(
-            chat_id=channel_id,
-            text=full_text,
+            chat_id=TARGET_CHANNEL_ID,
+            text=f"🔐 پروکسی:\n\n{ text }\n\n{FOOTER_TAG}",
+            reply_markup=button,
+        )
+        await update.message.reply_text("پروکسی ارسال شد ✅")
+        return
+
+    if is_config(text):
+        await context.bot.send_message(
+            chat_id=TARGET_CHANNEL_ID,
+            text=f"<code>{text}</code>\n\n{FOOTER_TAG}",
             parse_mode="HTML",
         )
-    except Exception as e:
-        logger.exception("send config to channel: %s", e)
-        await query.edit_message_text(
-            "❌ ارسال به کانال با خطا مواجه شد. لطفاً بعداً تلاش کنید."
-        )
-        await query.message.reply_text("منوی اصلی:", reply_markup=main_menu_keyboard())
-        context.user_data.clear()
+        await update.message.reply_text("کانفیگ ارسال شد ✅")
         return
 
-    await query.edit_message_text("✅ کانفیگ شما با موفقیت در کانال ثبت شد.")
-    await query.message.reply_text("منوی اصلی:", reply_markup=main_menu_keyboard())
-    context.user_data.clear()
+    await update.message.reply_text("❌ متن ارسال‌شده کانفیگ یا پروکسی معتبر نیست.")
 
 
-async def handle_proxy_operator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    if not user:
-        return
-    if is_banned(user.id):
-        await query.edit_message_text("⛔️ شما از استفاده از ربات محروم شده‌اید.")
-        return
-    if not is_bot_enabled() and not is_admin(user.id):
-        await query.edit_message_text("⛔️ ربات موقتاً خاموش است. لطفاً بعداً تلاش کنید.")
-        return
-    data = query.data or ""
-    if not data.startswith("proxy_"):
-        return
-    operator = data.replace("proxy_", "", 1)
-    context.user_data["proxy_operator"] = operator
-    context.user_data.pop("state", None)
-
-    link = context.user_data.get("proxy_link", "")
-    name = context.user_data.get("proxy_name", "")
-    sender_username = update.effective_user.username if update.effective_user else ""
-    sender_id = update.effective_user.id if update.effective_user else 0
-
-    header = f'پروکسی #پروکسی ارسالی از "{html.escape(name)}"'
-    body = html.escape(link)
-    footer = f"اپراتور: {operator}\n\n{FOOTER_TAG}"
-    full_text = f"{header}\n\n<code>{body}</code>\n\n{footer}"
-
-    try:
-        await context.bot.send_message(
-            chat_id=get_target_channel_id(),
-            text=full_text,
-            parse_mode="HTML",
-            reply_markup=reply_markup,
-        )
-    except Exception as e:
-        logger.exception("send proxy to channel: %s", e)
-        await query.edit_message_text(
-            "❌ ارسال به کانال با خطا مواجه شد. لطفاً بعداً تلاش کنید."
-        )
-        await query.message.reply_text("منوی اصلی:", reply_markup=main_menu_keyboard())
-        context.user_data.clear()
-        return
-
-    await query.edit_message_text("✅ پروکسی شما با موفقیت در کانال ثبت شد.")
-    await query.message.reply_text("منوی اصلی:", reply_markup=main_menu_keyboard())
-    context.user_data.clear()
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    msg = update.message
-    user = update.effective_user
-    if user:
-        if is_banned(user.id):
-            await update.message.reply_text("⛔️ شما از استفاده از ربات محروم شده‌اید.")
-            return
-        if not is_bot_enabled() and not is_admin(user.id):
-            await update.message.reply_text("⛔️ ربات موقتاً خاموش است. لطفاً بعداً تلاش کنید.")
-            return
-
-    text = (msg.text or msg.caption or "").strip()
-    state = context.user_data.get("state")
-
-    if state == STATE_CONFIG_LINK:
-        if not text or not is_valid_v2ray_config(text):
-            await update.message.reply_text("❌ این متن شبیه کانفیگ V2Ray/لینک اشتراک نیست. لطفاً یک کانفیگ معتبر (مثل vmess:// یا vless:// یا لینک https) ارسال کنید.")
-            return
-        context.user_data["config_link"] = text
-        context.user_data["state"] = STATE_CONFIG_NAME
-        await update.message.reply_text(
-            "نامی که دوست دارید این کانفیگ با آن منتشر شود را بنویسید (مثلاً آیدی کانال یا یک نام دلخواه):"
-        )
-        return
-
-    if state == STATE_CONFIG_NAME:
-        context.user_data["config_name"] = text
-        context.user_data["state"] = STATE_CONFIG_OPERATOR
-        await update.message.reply_text(
-            "با چه اینترنتی متصل بودید؟",
-            reply_markup=operator_keyboard("config"),
-        )
-        return
-
-    if state == STATE_PROXY_LINK:
-        if not text:
-            await update.message.reply_text("لطفاً پروکسی تلگرام را ارسال کنید.")
-            return
-        context.user_data["proxy_link"] = text
-        context.user_data["state"] = STATE_PROXY_NAME
-        await update.message.reply_text(
-            "نامی که دوست دارید این پروکسی با آن منتشر شود را بنویسید (مثلاً آیدی کانال یا یک نام دلخواه):"
-        )
-        return
-
-    if state == STATE_PROXY_NAME:
-        context.user_data["proxy_name"] = text
-        context.user_data["state"] = STATE_PROXY_OPERATOR
-        await update.message.reply_text(
-            "با چه اینترنتی متصل بودید؟",
-            reply_markup=operator_keyboard("proxy"),
-        )
-        return
-
-    # اگر در هیچ جریان خاصی نبود، منو نشان بده
-    is_member = await is_member_of_sponsor(context.application, update.effective_user.id)
-    if is_member:
-        await update.message.reply_text(
-            "یکی از گزینه‌ها را انتخاب کنید:",
-            reply_markup=main_menu_keyboard(),
-        )
-    else:
-        await update.message.reply_text(
-            "برای شروع /start را بزنید و در کانال اسپانسر عضو شوید."
-        )
-
-
-def main() -> None:
-    request = HTTPXRequest(
-        connect_timeout=config.CONNECT_TIMEOUT,
-        read_timeout=config.READ_TIMEOUT,
-        write_timeout=config.WRITE_TIMEOUT,
-        proxy=config.PROXY_URL,
-    )
-    app = (
-        Application.builder()
-        .token(config.BOT_TOKEN)
-        .request(request)
-        .build()
-    )
+# ---------- main ----------
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+
     app.add_handler(CommandHandler("status", admin_status))
-    app.add_handler(CommandHandler("on", admin_on))
     app.add_handler(CommandHandler("off", admin_off))
+    app.add_handler(CommandHandler("on", admin_on))
     app.add_handler(CommandHandler("ban", admin_ban))
     app.add_handler(CommandHandler("unban", admin_unban))
-    app.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
-    app.add_handler(CallbackQueryHandler(handle_config_operator, pattern="^config_"))
-    app.add_handler(CallbackQueryHandler(handle_proxy_operator, pattern="^proxy_"))
-    app.add_handler(CallbackQueryHandler(main_menu_callback, pattern="^(send_config|send_proxy)$"))
-    app.add_handler(
-        MessageHandler(
-            (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
-            handle_message,
-        )
-    )
 
-    logger.info("Bot starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("Bot started...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
